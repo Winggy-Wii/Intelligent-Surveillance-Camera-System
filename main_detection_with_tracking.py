@@ -2,7 +2,6 @@ import argparse
 from random import randint
 import time
 from pathlib import Path
-
 import socket
 import cv2
 import torch
