@@ -30,6 +30,7 @@ from shapely.geometry.polygon import Polygon
 # For SORT tracking
 import skimage
 from sort import *
+from queue import Queue
 
 lock = threading.Lock()
 # initialize a flask object
@@ -53,6 +54,8 @@ horVal = 90
 vertVal = 90
 tracking_lock_100 = False
 tracking_lock_200 = False
+
+call_alarm = False
 try:
     requests.get('http://192.168.1.200/control?var=framesize&val=9')
     requests.get('http://192.168.1.100/control?var=framesize&val=9')
@@ -69,6 +72,10 @@ try:
     requests.get("http://192.168.1.100/control?var=gainceiling&val=1")
     requests.get("http://192.168.1.200/control?var=gainceiling&val=1")
     time.sleep(1)
+    clientSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    clientSocket.connect(("192.168.1.150", 8888))
+    clientSocket2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    clientSocket2.connect(("192.168.1.180", 8888))
 except:
     None
 
@@ -144,7 +151,7 @@ def face_detected():
     playsound('mixkit-classic-alarm-995.wav')
 
 
-def detect(camIPLink, outputframe):
+def detect(camIPLink, outputframe, in_q):
     global outputFrame, outputFrame_second, Face_found_time, Face_found_time_prev, horVal, vertVal, cam_pan_prev, cam_tilt_prev, tracking_lock_200, tracking_lock_100, Mouse_posX_100, Mouse_posY_100, Mouse_posX_200, Mouse_posY_200
     Number_of_faces = 0
     Send_signal = False
@@ -219,8 +226,13 @@ def detect(camIPLink, outputframe):
             rand_color = (r, g, b)
             rand_color_list.append(rand_color)
     # .........................
-
         for path, img, im0s, vid_cap in dataset:
+            try:
+                exchange_data = in_q.get(False)
+
+            except:
+                exchange_data = None
+            print(exchange_data)
             img = torch.from_numpy(img).to(device)
             img = img.half() if half else img.float()  # uint8 to fp16/32
             img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -318,11 +330,11 @@ def detect(camIPLink, outputframe):
                         cv2.circle(im0, (x_center, y_center),
                                    1, (255, 0, 0), 5)
                     if source == "http://192.168.1.200:81/stream":
-                        if(Mouse_posY_200 != Mouse_posY_200_prev or Mouse_posX_200_prev != Mouse_posX_200):
+                        if(Mouse_posY_200 != Mouse_posY_200_prev or Mouse_posX_200_prev != Mouse_posX_200 or exchange_data[1] is not None):
                             print("switching 200 lock")
                             tracking_lock_200 = not tracking_lock_200
                     if source == "http://192.168.1.100:81/stream":
-                        if(Mouse_posY_100 != Mouse_posY_100_prev or Mouse_posX_100_prev != Mouse_posX_100):
+                        if(Mouse_posY_100 != Mouse_posY_100_prev or Mouse_posX_100_prev != Mouse_posX_100 or exchange_data[0] is not None):
                             tracking_lock_100 = not tracking_lock_100
                             print("switching 100 lock")
                 # ........................................................
@@ -418,12 +430,12 @@ def detect(camIPLink, outputframe):
                         "%A %d %B %Y %I:%M:%S%p"), (10, im0.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
                     if Send_signal == True:
+                        data = "toggle"
+                        clientSocket2.send(data.encode())
+                        clientSocket.send(data.encode())
                         t4 = threading.Thread(target=face_detected)
                         t4.daemon = True
                         t4.start()
-                        t8 = threading.Thread(target=send_alarm)
-                        t8.daemon = True
-                        t8.start()
                         temp_data = [Number_of_faces, timestamp.strftime(
                             "%A %d %B %Y %I:%M:%S%p")]
                         Save_data.append(temp_data)
@@ -440,27 +452,40 @@ def detect(camIPLink, outputframe):
             Save_data.clear()
 
 
-def send_alarm():
-    try:
-        clientSocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def send_alarm(out_q):
+    Cam1State = "Off"
+    Cam2State = "Off"
 
-        # Connect to the server
+    # Send data to server
+    data = "Cam 1:Off/Cam 2:Off/"
+    clientSocket.send(data.encode())
 
-        clientSocket.connect(("192.168.1.150", 8888))
-
-        # Send data to server
-
-        data = "toggle"
-
-        clientSocket.send(data.encode())
-
-        # Receive data from server
-
+    # Print to the console
+    prevData = ""
+    while True:
         dataFromServer = clientSocket.recv(1024)
-
+        if(dataFromServer.decode("utf-8") == 'togglecam2'):
+            if(Cam2State == "Off"):
+                Cam2State = "On"
+            else:
+                Cam2State = "Off"
+        if(dataFromServer.decode("utf-8") == 'togglecam1'):
+            if(Cam1State == "Off"):
+                Cam1State = "On"
+            else:
+                Cam1State = "Off"
+        if(dataFromServer.decode("utf-8") == 'toggle'):
+            data = "toggle"
+            clientSocket.send(data.encode())
+        data = "Cam 1:" + Cam1State + "/" + "Cam 2:" + Cam2State + "/"
+        exchange_data = [Cam1State, Cam2State]
+        out_q.put(exchange_data)
+        print(data)
+        if (data != prevData):
+            clientSocket.send(data.encode())
+            time.sleep(0.1)
+        prevData = data
         print(dataFromServer)
-    except:
-        None
 
 
 def check_if_file_empty_or_nonexist():
@@ -553,6 +578,7 @@ def web_mouse_click():
 
 
 if __name__ == '__main__':
+    q = Queue()
     Face_found_time = time.time()
     ap = argparse.ArgumentParser()
     ap.add_argument("-i", "--ip", type=str, required=True,
@@ -560,12 +586,15 @@ if __name__ == '__main__':
     ap.add_argument("-o", "--port", type=int, required=True,
                     help="ephemeral port number of the server (1024 to 65535)")
     args = vars(ap.parse_args())
-    t = threading.Thread(target=detect, args=(camIPLink, outputFrame,))
+    t = threading.Thread(target=detect, args=(camIPLink, outputFrame, q,))
     t.daemon = True
-    t.start()
     t1 = threading.Thread(target=detect, args=(
-        camIPLink2, outputFrame_second,))
+        camIPLink2, outputFrame_second, q,))
     t1.daemon = True
+    t8 = threading.Thread(target=send_alarm, args=(q,))
+    t8.daemon = True
+    t8.start()
+    t.start()
     t1.start()
     app.run(host=args["ip"], port=args["port"], debug=True,
             threaded=True, use_reloader=False)
